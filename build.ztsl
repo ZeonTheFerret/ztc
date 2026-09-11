@@ -1,0 +1,9 @@
+ztsl.start
+}
+func "build"
+sys.exec
+```shell
+gcc -std=c23 -Wall -Wextra -O2 ztc.c -o ztc -lcrypto
+```
+}
+ztsl.end
