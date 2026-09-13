@@ -18,7 +18,7 @@
 
 #include <openssl/sha.h>
 
-#define ZTC_VERSION "0.0.3"
+#define ZTC_VERSION "0.0.4"
 
 static void *xmalloc(size_t n) {
     void *p = malloc(n);
@@ -844,6 +844,13 @@ if_build:
         }
     }
 
+    
+    const char *maybe_endif = peek(p);
+    if (maybe_endif && starts_with_kw(maybe_endif, "endif")) {
+        char *ei = consume(p);
+        free(ei);
+    }
+
     return stmt;
 
 if_fail:
@@ -865,6 +872,9 @@ static Stmt *parse_stmt_list(Parser *p, const char *terminator) {
 
         
         if (line[0] == '}') break;
+
+        
+        if (starts_with_kw(line, "endif")) break;
 
         
         if (starts_with_kw(line, "ztsl.end") || starts_with_kw(line, "zstl.end"))
