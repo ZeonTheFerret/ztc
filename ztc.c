@@ -15,10 +15,12 @@
 #include <sys/types.h>
 #include <fcntl.h>
 #include <signal.h>
+#include <math.h>
+#include <stdint.h>
 
 #include <openssl/sha.h>
 
-#define ZTC_VERSION "0.0.4"
+#define ZTC_VERSION "0.0.5"
 
 static void *xmalloc(size_t n) {
     void *p = malloc(n);
@@ -111,6 +113,7 @@ static const char *suggest_keyword(const char *word) {
         "empty", "file", "returns",
         "read_file", "delete_file", "create_file",
         "write_on_file", "append_file", "ccompat",
+        "calculate",
         NULL
     };
     size_t wlen = 0;
@@ -289,6 +292,7 @@ typedef enum {
     K_WRITE,
     K_APPEND,
     K_CCOMPAT,
+    K_FLOATCALC,
 } StmtKind;
 
 typedef enum {
@@ -329,6 +333,7 @@ struct Stmt {
         struct { char *path; } mkfile;
         struct { char *path; char *code; } writefile;
         struct { char *code; } ccompat;
+        struct { int width; char op; char *lhs_raw; char *rhs_raw; char *varname; } floatcalc;
     };
 };
 
@@ -450,6 +455,11 @@ static void stmt_free(Stmt *s) {
                 break;
             case K_CCOMPAT:
                 free(s->ccompat.code);
+                break;
+            case K_FLOATCALC:
+                free(s->floatcalc.lhs_raw);
+                free(s->floatcalc.rhs_raw);
+                free(s->floatcalc.varname);
                 break;
         }
         free(s);
@@ -639,6 +649,22 @@ static bool match_word_boundary(const char *s, const char *word, size_t wlen) {
     if (strncasecmp(s, word, wlen) != 0) return false;
     char c = s[wlen];
     return (c == '\0' || isspace((unsigned char)c) || c == ';');
+}
+
+static bool match_float_calc_kw(const char *line, int *width_out, size_t *len_out) {
+    if (strncasecmp(line, "float", 5) != 0) return false;
+    const char *p = line + 5;
+    const char *dstart = p;
+    while (isdigit((unsigned char)*p)) p++;
+    if (p == dstart) return false;
+    int width = atoi(dstart);
+    if (strncasecmp(p, "_calculate", 10) != 0) return false;
+    const char *after = p + 10;
+    if (!(*after == '\0' || isspace((unsigned char)*after) || *after == ';'))
+        return false;
+    *width_out = width;
+    *len_out = (size_t)(after - line);
+    return true;
 }
 
 static Stmt *parse_if(Parser *p) {
@@ -987,6 +1013,95 @@ static Stmt *parse_stmt(Parser *p) {
         s->writefile.code = code;
         return s;
     }
+    {
+        int width; size_t kwlen;
+        if (match_float_calc_kw(line, &width, &kwlen)) {
+            if (width != 32 && width != 42 && width != 64 &&
+                width != 76 && width != 128) {
+                zt_error("unsupported float width '%d' "
+                        "(expected 32, 42, 64, 76 or 128)", width);
+                char *l = consume(p);
+                free(l);
+                parse_error(p, "unsupported float width");
+                return NULL;
+            }
+            char *l = consume(p);
+            const char *cursor = l + kwlen;
+            while (*cursor && isspace((unsigned char)*cursor)) cursor++;
+
+            const char *start = cursor;
+            while (*cursor && !isspace((unsigned char)*cursor)) cursor++;
+            if (cursor == start) {
+                parse_error(p, "expected left operand in float calculation");
+                free(l);
+                return NULL;
+            }
+            char *lhs = xstrndup(start, (size_t)(cursor - start));
+            while (*cursor && isspace((unsigned char)*cursor)) cursor++;
+
+            char op = *cursor;
+            if (op != '+' && op != '-' && op != '*' && op != '/') {
+                zt_error("expected +, -, * or / in float calculation");
+                free(lhs);
+                free(l);
+                parse_error(p, "bad operator in float calculation");
+                return NULL;
+            }
+            cursor++;
+            while (*cursor && isspace((unsigned char)*cursor)) cursor++;
+
+            start = cursor;
+            while (*cursor && !isspace((unsigned char)*cursor)) cursor++;
+            if (cursor == start) {
+                parse_error(p, "expected right operand in float calculation");
+                free(lhs);
+                free(l);
+                return NULL;
+            }
+            char *rhs = xstrndup(start, (size_t)(cursor - start));
+            while (*cursor && isspace((unsigned char)*cursor)) cursor++;
+
+            if (!match_word_boundary(cursor, "as", 2)) {
+                parse_error(p, "expected 'as' in float calculation");
+                free(lhs);
+                free(rhs);
+                free(l);
+                return NULL;
+            }
+            cursor += 2;
+            while (*cursor && isspace((unsigned char)*cursor)) cursor++;
+
+            if (!match_word_boundary(cursor, "variable", 8)) {
+                parse_error(p, "expected 'variable' in float calculation");
+                free(lhs);
+                free(rhs);
+                free(l);
+                return NULL;
+            }
+            cursor += 8;
+            while (*cursor && isspace((unsigned char)*cursor)) cursor++;
+
+            const char *endp = NULL;
+            char *varname = extract_quoted(cursor, &endp);
+            free(l);
+            if (!varname) {
+                parse_error(p, "expected quoted variable name after 'variable'");
+                free(lhs);
+                free(rhs);
+                return NULL;
+            }
+
+            Stmt *s = xmalloc(sizeof(Stmt));
+            memset(s, 0, sizeof(*s));
+            s->kind = K_FLOATCALC;
+            s->floatcalc.width  = width;
+            s->floatcalc.op     = op;
+            s->floatcalc.lhs_raw = lhs;
+            s->floatcalc.rhs_raw = rhs;
+            s->floatcalc.varname = varname;
+            return s;
+        }
+    }
     
     if (starts_with_kw(line, "ccompat")) {
         char *l = consume(p);
@@ -1301,6 +1416,90 @@ static bool path_is_empty_file(const char *path) {
         return false;
     }
     return st.st_size == 0;
+}
+
+static double quantize_mantissa_bits(double v, int keep_bits) {
+    
+    if (v == 0.0 || !isfinite(v) || keep_bits >= 52) return v;
+    uint64_t bits;
+    memcpy(&bits, &v, sizeof(bits));
+    int drop = 52 - keep_bits;
+    uint64_t half = (uint64_t)1 << (drop - 1);
+    uint64_t mask = ((uint64_t)1 << drop) - 1;
+    uint64_t frac = bits & mask;
+    bits &= ~mask;
+    if (frac >= half) bits += ((uint64_t)1 << drop);
+    memcpy(&v, &bits, sizeof(bits));
+    return v;
+}
+
+static char *compute_float_calc(int width, const char *lhs_s, char op,
+                                const char *rhs_s) {
+    char buf[80];
+
+    if (width == 32) {
+        float a = strtof(lhs_s, NULL);
+        float b = strtof(rhs_s, NULL);
+        float r = 0;
+        switch (op) {
+            case '+': r = a + b; break;
+            case '-': r = a - b; break;
+            case '*': r = a * b; break;
+            case '/':
+                if (b == 0.0f) { return NULL; }
+                r = a / b;
+                break;
+        }
+        snprintf(buf, sizeof(buf), "%.9g", (double)r);
+    } else if (width == 64 || width == 42) {
+        double a = strtod(lhs_s, NULL);
+        double b = strtod(rhs_s, NULL);
+        double r = 0;
+        switch (op) {
+            case '+': r = a + b; break;
+            case '-': r = a - b; break;
+            case '*': r = a * b; break;
+            case '/':
+                if (b == 0.0) { return NULL; }
+                r = a / b;
+                break;
+        }
+        if (width == 42) r = quantize_mantissa_bits(r, 30);
+        snprintf(buf, sizeof(buf), "%.17g", r);
+    } else if (width == 76) {
+        
+        long double a = strtold(lhs_s, NULL);
+        long double b = strtold(rhs_s, NULL);
+        long double r = 0;
+        switch (op) {
+            case '+': r = a + b; break;
+            case '-': r = a - b; break;
+            case '*': r = a * b; break;
+            case '/':
+                if (b == 0.0L) { return NULL; }
+                r = a / b;
+                break;
+        }
+        snprintf(buf, sizeof(buf), "%.21Lg", r);
+    } else { 
+        
+        __float128 a = strtold(lhs_s, NULL);
+        __float128 b = strtold(rhs_s, NULL);
+        __float128 r = 0;
+        switch (op) {
+            case '+': r = a + b; break;
+            case '-': r = a - b; break;
+            case '*': r = a * b; break;
+            case '/':
+                if (b == 0.0L) { return NULL; }
+                r = a / b;
+                break;
+        }
+        
+        long double disp = (long double)r;
+        snprintf(buf, sizeof(buf), "%.21Lg", disp);
+    }
+    return xstrdup(buf);
 }
 
 static bool eval_cond(Cond *c, Var *vars) {
@@ -1660,6 +1859,25 @@ static int exec_stmt(ExecCtx *ctx, Stmt *s) {
                     "skipping raw C block in interpreted run");
             return 0;
         }
+        case K_FLOATCALC: {
+            char *lhs_s = subst_vars(s->floatcalc.lhs_raw, *ctx->vars);
+            char *rhs_s = subst_vars(s->floatcalc.rhs_raw, *ctx->vars);
+            char *result = compute_float_calc(s->floatcalc.width, lhs_s,
+                    s->floatcalc.op, rhs_s);
+            free(lhs_s);
+            free(rhs_s);
+            if (!result) {
+                zt_error("float%d_calculate: division by zero",
+                        s->floatcalc.width);
+                return 1;
+            }
+            var_set(ctx->vars, s->floatcalc.varname, result);
+            if (ctx->verbose)
+                fprintf(stderr, "[float%d_calculate] %s = %s\n",
+                        s->floatcalc.width, s->floatcalc.varname, result);
+            free(result);
+            return 0;
+        }
     }
     return 0;
 }
@@ -1744,6 +1962,22 @@ static void serialize_stmt(dstring *out, Stmt *s) {
             dstr_append_cstr(out, s->ccompat.code);
             dstr_append_char(out, '\n');
             break;
+        case K_FLOATCALC: {
+            char widthbuf[16];
+            snprintf(widthbuf, sizeof(widthbuf), "%d", s->floatcalc.width);
+            dstr_append_cstr(out, "FLOATCALC float");
+            dstr_append_cstr(out, widthbuf);
+            dstr_append_char(out, ' ');
+            dstr_append_cstr(out, s->floatcalc.lhs_raw);
+            dstr_append_char(out, ' ');
+            dstr_append_char(out, s->floatcalc.op);
+            dstr_append_char(out, ' ');
+            dstr_append_cstr(out, s->floatcalc.rhs_raw);
+            dstr_append_cstr(out, " AS ");
+            dstr_append_cstr(out, s->floatcalc.varname);
+            dstr_append_char(out, '\n');
+            break;
+        }
     }
 }
 
