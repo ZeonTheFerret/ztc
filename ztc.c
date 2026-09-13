@@ -20,7 +20,7 @@
 
 #include <openssl/sha.h>
 
-#define ZTC_VERSION "0.0.5"
+#define ZTC_VERSION "0.1"
 
 static void *xmalloc(size_t n) {
     void *p = malloc(n);
@@ -667,6 +667,40 @@ static bool match_float_calc_kw(const char *line, int *width_out, size_t *len_ou
     return true;
 }
 
+static bool reject_if_misplaced_statement(Parser *p, const char *line) {
+    int width; size_t kwlen;
+    if (match_float_calc_kw(line, &width, &kwlen)) {
+        zt_error("'floatNN_calculate' is a statement and must be inside "
+                "a func \"name\" { ... } body, not here: '%s'", line);
+        parse_error(p, "floatNN_calculate outside a func body");
+        return true;
+    }
+
+    if (starts_with_kw(line, "define")) {
+        zt_error("'define' must be inside a func \"name\" { ... } body "
+                "or a ztslo.start/ztslo.end block, not here: '%s'", line);
+        parse_error(p, "define outside a func body or ztslo block");
+        return true;
+    }
+
+    static const char *stmt_keywords[] = {
+        "if", "sys.exec", "text.show",
+        "delete_file", "create_file",
+        "write_on_file", "append_file",
+        "ccompat",
+        NULL
+    };
+    for (size_t i = 0; stmt_keywords[i]; i++) {
+        if (starts_with_kw(line, stmt_keywords[i])) {
+            zt_error("'%s' is a statement and must be inside a func \"name\" "
+                    "{ ... } body, not here: '%s'", stmt_keywords[i], line);
+            parse_error(p, "statement outside a func body");
+            return true;
+        }
+    }
+    return false;
+}
+
 static Stmt *parse_if(Parser *p) {
     char *line = consume(p);
     if (!line) { parse_error(p, "EOF in if"); return NULL; }
@@ -1225,6 +1259,10 @@ static void parse_ztslo_block(Parser *p, Program *prog) {
         
         char *skip = consume(p);
         if (skip) {
+            if (reject_if_misplaced_statement(p, skip)) {
+                free(skip);
+                return;
+            }
             const char *sug = suggest_keyword(skip);
             if (sug) {
                 zt_error("unknown line in ztslo: '%s' (did you mean '%s'?)", skip, sug);
@@ -1292,6 +1330,10 @@ static void parse_ztsl_block(Parser *p, Program *prog) {
         
         char *skip = consume(p);
         if (skip) {
+            if (reject_if_misplaced_statement(p, skip)) {
+                free(skip);
+                return;
+            }
             const char *sug = suggest_keyword(skip);
             if (sug) {
                 zt_error("unknown top-level line: '%s' (did you mean '%s'?)", skip, sug);
@@ -1331,6 +1373,10 @@ static void parse_program(Parser *p, Program *prog) {
         }
         char *skip = consume(p);
         if (skip) {
+            if (reject_if_misplaced_statement(p, skip)) {
+                free(skip);
+                return;
+            }
             const char *sug = suggest_keyword(skip);
             if (sug) {
                 zt_error("unknown top-level line: '%s' (did you mean '%s'?)", skip, sug);
@@ -2468,7 +2514,7 @@ int main(int argc, char **argv) {
         func_free(prog.funcs);
         free(new_hash);
         free(stored);
-        return rc < 0 ? 1 : 0;
+        return rc == 0 ? 0 : 1;
     }
 
     
